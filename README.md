@@ -48,3 +48,9 @@ Mostly useful for testing, this property will re-create the domains everytime th
 ```java
     properties.setProperty("org.quartz.jobStore.recreate", "true");
 ```
+
+# About this project
+
+![3Pillar Global] (http://www.3pillarglobal.com/wp-content/themes/base/library/images/logo_3pg.png)
+
+**Quartz Simpledb Jobstore** is developed and maintained by [3Pillar Global](http://www.3pillarglobal.com/).
