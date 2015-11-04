@@ -17,6 +17,8 @@ package com.threepillar.labs.quartz.simpledb;
  * 
  */
 
+import java.io.IOException;
+import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -70,11 +72,11 @@ import com.amazonaws.services.simpledb.model.SelectResult;
  * This class implements a <code>{@link org.quartz.spi.JobStore}</code> that
  * utilizes AWS SimpleDB as its storage device.
  * </p>
- * 
+ * <p/>
  * <p>
  * Important: Currently it does not handle durable jobs and misfiring
  * </p>
- * 
+ *
  * @author Abhinav Maheshwari
  */
 public class SimpleDbJobStore implements JobStore {
@@ -136,6 +138,7 @@ public class SimpleDbJobStore implements JobStore {
 	private String awsSecretKey;
 	private String prefix;
 	private boolean recreate;
+	private boolean consistentPoll;
 
 	/*
 	 * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -151,10 +154,9 @@ public class SimpleDbJobStore implements JobStore {
 	private QueryBuilder query;
 	private final ISO8601DateFormat dateFormat = new ISO8601DateFormat();
 
-	protected final Object lock = new Object();
 	protected long misfireThreshold = 5000l;
 	protected SchedulerSignaler signaler;
-	private final Log log = LogFactory.getLog(getClass());
+	private static final Log log = LogFactory.getLog(SimpleDbJobStore.class);
 
 	/*
 	 * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -209,6 +211,20 @@ public class SimpleDbJobStore implements JobStore {
 		this.recreate = recreate;
 	}
 
+	public boolean isConsistentPoll() {
+		return consistentPoll;
+	}
+
+	/**
+	 * Use consistent read for polling for jobs?
+	 * Pros: Triggers can fire immediately after you add them, saving you waiting for a ~30s idle timeout in Quartz.
+	 * Cons: Lower performance overall.
+	 * Default: false
+	 */
+	public void setConsistentPoll(boolean consistentPoll) {
+		this.consistentPoll = consistentPoll;
+	}
+
 	/**
 	 * <p>
 	 * Called by the QuartzScheduler before the <code>JobStore</code> is used,
@@ -217,7 +233,7 @@ public class SimpleDbJobStore implements JobStore {
 	 */
 	@Override
 	public void initialize(ClassLoadHelper loadHelper,
-			SchedulerSignaler signaler) {
+	                       SchedulerSignaler signaler) {
 
 		logDebug("Initializing SimpleDbJobStore");
 		this.jobDomain = String.format("%s.%s", prefix,
@@ -225,8 +241,7 @@ public class SimpleDbJobStore implements JobStore {
 		this.triggerDomain = String.format("%s.%s", prefix,
 				SimpleDbJobStore.TRIGGER_DOMAIN);
 		this.query = new QueryBuilder(this.jobDomain, this.triggerDomain);
-		this.amazonSimpleDb = new AmazonSimpleDBClient(new BasicAWSCredentials(
-				awsAccessKey, awsSecretKey));
+		this.amazonSimpleDb = makeSimpleDbClient(awsAccessKey, awsSecretKey);
 		this.signaler = signaler;
 
 		boolean foundJobs = false, foundTriggers = false;
@@ -261,6 +276,20 @@ public class SimpleDbJobStore implements JobStore {
 		log.info("SimpleDbJobStore initialized.");
 	}
 
+	static AmazonSimpleDBClient makeSimpleDbClient(String accessKey, String secretKey) {
+		if (!isNullOrEmpty(accessKey) || !isNullOrEmpty(secretKey)) {
+			return new AmazonSimpleDBClient(new BasicAWSCredentials(
+					accessKey, secretKey));
+		} else {
+			logDebug("allowing AWS tools to locate authentication credentials, as you didn't provide them");
+			return new AmazonSimpleDBClient();
+		}
+	}
+
+	private static boolean isNullOrEmpty(String str) {
+		return str == null || str.isEmpty();
+	}
+
 	private List<String> getSimpleDbDomainNames() {
 
 		ListDomainsResult result = amazonSimpleDb.listDomains();
@@ -288,8 +317,6 @@ public class SimpleDbJobStore implements JobStore {
 	 * The number of milliseconds by which a trigger must have missed its
 	 * next-fire-time, in order for it to be considered "misfired" and thus have
 	 * its misfire instruction applied.
-	 * 
-	 * @param misfireThreshold
 	 */
 	public void setMisfireThreshold(long misfireThreshold) {
 		if (misfireThreshold < 1) {
@@ -321,18 +348,15 @@ public class SimpleDbJobStore implements JobStore {
 	 * Store the given <code>{@link org.quartz.JobDetail}</code> and
 	 * <code>{@link org.quartz.Trigger}</code>.
 	 * </p>
-	 * 
-	 * @param newJob
-	 *            The <code>JobDetail</code> to be stored.
-	 * @param newTrigger
-	 *            The <code>Trigger</code> to be stored.
-	 * @throws ObjectAlreadyExistsException
-	 *             if a <code>Job</code> with the same name/group already
-	 *             exists.
+	 *
+	 * @param newJob     The <code>JobDetail</code> to be stored.
+	 * @param newTrigger The <code>Trigger</code> to be stored.
+	 * @throws ObjectAlreadyExistsException if a <code>Job</code> with the same name/group already
+	 *                                      exists.
 	 */
 	@Override
 	public void storeJobAndTrigger(SchedulingContext ctxt, JobDetail newJob,
-			Trigger newTrigger) throws JobPersistenceException {
+	                               Trigger newTrigger) throws JobPersistenceException {
 		storeJob(ctxt, newJob, false);
 		storeTrigger(ctxt, newTrigger, false);
 	}
@@ -341,23 +365,20 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Store the given <code>{@link org.quartz.Job}</code>.
 	 * </p>
-	 * 
-	 * @param newJob
-	 *            The <code>Job</code> to be stored.
-	 * @param replaceExisting
-	 *            If <code>true</code>, any <code>Job</code> existing in the
-	 *            <code>JobStore</code> with the same name & group should be
-	 *            over-written.
-	 * @throws ObjectAlreadyExistsException
-	 *             if a <code>Job</code> with the same name/group already
-	 *             exists, and replaceExisting is set to false.
+	 *
+	 * @param newJob          The <code>Job</code> to be stored.
+	 * @param replaceExisting If <code>true</code>, any <code>Job</code> existing in the
+	 *                        <code>JobStore</code> with the same name & group should be
+	 *                        over-written.
+	 * @throws ObjectAlreadyExistsException if a <code>Job</code> with the same name/group already
+	 *                                      exists, and replaceExisting is set to false.
 	 */
 	@Override
 	public void storeJob(SchedulingContext ctxt, JobDetail newJob,
-			boolean replaceExisting) throws ObjectAlreadyExistsException {
+	                     boolean replaceExisting) throws ObjectAlreadyExistsException {
 
 		logDebug("Storing Job: ", newJob.getFullName());
-		ReplaceableItem item = null;
+
 		try {
 			List<ReplaceableAttribute> attributes = new ArrayList<ReplaceableAttribute>();
 			attributes.add(new ReplaceableAttribute(JOB_NAME, newJob.getName(),
@@ -372,11 +393,11 @@ public class SimpleDbJobStore implements JobStore {
 				attributes.add(new ReplaceableAttribute(JOB_DATA_MAP, mapper
 						.writeValueAsString(newJob.getJobDataMap()), true));
 			}
-			item = new ReplaceableItem(JobWrapper.getJobNameKey(newJob),
+			ReplaceableItem item = new ReplaceableItem(JobWrapper.getJobNameKey(newJob),
 					attributes);
 			amazonSimpleDb.batchPutAttributes(new BatchPutAttributesRequest(
 					jobDomain, Collections.singletonList(item)));
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error("Could not store Job: " + newJob.getFullName(), e);
 		}
 
@@ -388,52 +409,43 @@ public class SimpleDbJobStore implements JobStore {
 	 * name, and any <code>{@link org.quartz.Trigger}</code> s that reference
 	 * it.
 	 * </p>
-	 * 
-	 * @param jobName
-	 *            The name of the <code>Job</code> to be removed.
-	 * @param groupName
-	 *            The group name of the <code>Job</code> to be removed.
+	 *
+	 * @param jobName   The name of the <code>Job</code> to be removed.
+	 * @param groupName The group name of the <code>Job</code> to be removed.
 	 * @return <code>true</code> if a <code>Job</code> with the given name &
 	 *         group was found and removed from the store.
 	 */
 	@Override
 	public boolean removeJob(SchedulingContext ctxt, String jobName,
-			String groupName) {
+	                         String groupName) {
 		logDebug("Removing Job: ", groupName, ".", jobName);
-		try {
-			String key = JobWrapper.getJobNameKey(jobName, groupName);
-			amazonSimpleDb.deleteAttributes(new DeleteAttributesRequest(
-					jobDomain, key));
-			return true;
-		} catch (Exception e) {
-			log.error("Could not remove Job: " + groupName + "." + jobName, e);
-			return false;
-		}
+		String key = JobWrapper.getJobNameKey(jobName, groupName);
+		amazonSimpleDb.deleteAttributes(new DeleteAttributesRequest(
+				jobDomain, key));
+
+		// delete attributes will succeed if the item doesn't exist,
+		// so we can't easily detect the job-didn't-exist return value here
+		return true;
 	}
 
 	/**
 	 * <p>
 	 * Store the given <code>{@link org.quartz.Trigger}</code>.
 	 * </p>
-	 * 
-	 * @param newTrigger
-	 *            The <code>Trigger</code> to be stored.
-	 * @param replaceExisting
-	 *            If <code>true</code>, any <code>Trigger</code> existing in the
-	 *            <code>JobStore</code> with the same name & group should be
-	 *            over-written.
-	 * @throws ObjectAlreadyExistsException
-	 *             if a <code>Trigger</code> with the same name/group already
-	 *             exists, and replaceExisting is set to false.
-	 * 
+	 *
+	 * @param newTrigger      The <code>Trigger</code> to be stored.
+	 * @param replaceExisting If <code>true</code>, any <code>Trigger</code> existing in the
+	 *                        <code>JobStore</code> with the same name & group should be
+	 *                        over-written.
+	 * @throws ObjectAlreadyExistsException if a <code>Trigger</code> with the same name/group already
+	 *                                      exists, and replaceExisting is set to false.
 	 * @see #pauseTriggerGroup(SchedulingContext, String)
 	 */
 	@Override
 	public void storeTrigger(SchedulingContext ctxt, Trigger newTrigger,
-			boolean replaceExisting) throws JobPersistenceException {
+	                         boolean replaceExisting) throws JobPersistenceException {
 
 		logDebug("Storing Trigger: ", newTrigger.getFullName());
-		ReplaceableItem item = null;
 		try {
 
 			List<ReplaceableAttribute> attributes = new ArrayList<ReplaceableAttribute>();
@@ -465,8 +477,6 @@ public class SimpleDbJobStore implements JobStore {
 				attributes.add(new ReplaceableAttribute(TRIGGER_NEXT_FIRE_TIME,
 						dateFormat.format(newTrigger.getNextFireTime()), true));
 			}
-			item = new ReplaceableItem(
-					TriggerWrapper.getTriggerNameKey(newTrigger), attributes);
 			String json = mapper.writeValueAsString(newTrigger);
 			attributes.add(new ReplaceableAttribute(TRIGGER_JSON_LENGTH, String
 					.valueOf(json.length()), true));
@@ -479,9 +489,11 @@ public class SimpleDbJobStore implements JobStore {
 						+ String.valueOf(i), json.substring(
 						i * MAX_ATTR_LENGTH, end), true));
 			}
+			ReplaceableItem item = new ReplaceableItem(
+					TriggerWrapper.getTriggerNameKey(newTrigger), attributes);
 			amazonSimpleDb.batchPutAttributes(new BatchPutAttributesRequest(
 					triggerDomain, Collections.singletonList(item)));
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error("Could not store Trigger: " + newTrigger.getFullName(), e);
 		}
 
@@ -492,34 +504,29 @@ public class SimpleDbJobStore implements JobStore {
 	 * Remove (delete) the <code>{@link org.quartz.Trigger}</code> with the
 	 * given name.
 	 * </p>
-	 * 
-	 * @param triggerName
-	 *            The name of the <code>Trigger</code> to be removed.
-	 * @param groupName
-	 *            The group name of the <code>Trigger</code> to be removed.
+	 *
+	 * @param triggerName The name of the <code>Trigger</code> to be removed.
+	 * @param groupName   The group name of the <code>Trigger</code> to be removed.
 	 * @return <code>true</code> if a <code>Trigger</code> with the given name &
 	 *         group was found and removed from the store.
 	 */
 	@Override
 	public boolean removeTrigger(SchedulingContext ctxt, String triggerName,
-			String groupName) {
+	                             String groupName) {
 		return removeTrigger(ctxt, triggerName, groupName, true);
 	}
 
 	private boolean removeTrigger(SchedulingContext ctxt, String triggerName,
-			String groupName, boolean removeOrphanedJob) {
+	                              String groupName, boolean removeOrphanedJob) {
 		logDebug("Removing Trigger: ", groupName, ".", triggerName);
-		try {
-			String key = TriggerWrapper.getTriggerNameKey(triggerName,
-					groupName);
-			amazonSimpleDb.deleteAttributes(new DeleteAttributesRequest(
-					triggerDomain, key));
-			return true;
-		} catch (Exception e) {
-			log.error("Could not remove Trigger: " + groupName + "."
-					+ triggerName, e);
-			return false;
-		}
+		String key = TriggerWrapper.getTriggerNameKey(triggerName,
+				groupName);
+		amazonSimpleDb.deleteAttributes(new DeleteAttributesRequest(
+				triggerDomain, key));
+
+		// delete attributes will succeed if the item doesn't exist,
+		// so we can't easily detect the job-didn't-exist return value here
+		return true;
 	}
 
 	/**
@@ -528,7 +535,7 @@ public class SimpleDbJobStore implements JobStore {
 	 */
 	@Override
 	public boolean replaceTrigger(SchedulingContext ctxt, String triggerName,
-			String groupName, Trigger newTrigger)
+	                              String groupName, Trigger newTrigger)
 			throws JobPersistenceException {
 		logDebug("Replacing Trigger: ", triggerName, ".", groupName, " with ",
 				newTrigger.getFullName());
@@ -544,8 +551,7 @@ public class SimpleDbJobStore implements JobStore {
 				removeTrigger(ctxt, triggerName, groupName);
 				storeTrigger(ctxt, newTrigger, false);
 			} catch (JobPersistenceException jpe) {
-				storeTrigger(ctxt, found, false); // put previous trigger
-													// back...
+				storeTrigger(ctxt, found, false); // put previous trigger back...
 				throw jpe;
 			}
 		}
@@ -558,43 +564,58 @@ public class SimpleDbJobStore implements JobStore {
 	 * Retrieve the <code>{@link org.quartz.JobDetail}</code> for the given
 	 * <code>{@link org.quartz.Job}</code>.
 	 * </p>
-	 * 
-	 * @param jobName
-	 *            The name of the <code>Job</code> to be retrieved.
-	 * @param groupName
-	 *            The group name of the <code>Job</code> to be retrieved.
+	 *
+	 * @param jobName   The name of the <code>Job</code> to be retrieved.
+	 * @param groupName The group name of the <code>Job</code> to be retrieved.
 	 * @return The desired <code>Job</code>, or null if there is no match.
 	 */
 	@Override
 	public JobDetail retrieveJob(SchedulingContext ctxt, String jobName,
-			String groupName) {
+	                             String groupName) {
 		logDebug("Retrieving Job: ", groupName, ".", jobName);
 		String key = JobWrapper.getJobNameKey(jobName, groupName);
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(jobDomain, key)
-						.withConsistentRead(new Boolean(true)));
-		JobDetail job = null;
+						.withConsistentRead(Boolean.TRUE));
 		try {
-			job = jobDetailFromAttributes(result.getAttributes());
-		} catch (Exception e) {
+			return jobDetailFromAttributes(result.getAttributes());
+		} catch (IOException e) {
 			log.error("Could not retrieve Job: " + groupName + "." + jobName, e);
+			return null;
 		}
-		return job;
 	}
 
 	private JobDetail jobDetailFromAttributes(List<Attribute> attributes)
-			throws Exception {
+			throws IOException {
 		if (attributes == null || attributes.size() == 0) {
-			throw new Exception("No attributes");
+			throw new IllegalArgumentException("No attributes");
 		}
 		Map<String, String> map = new HashMap<String, String>();
 		for (Attribute attr : attributes) {
 			map.put(attr.getName(), attr.getValue());
 		}
-		Class<? extends JobDetail> clz = Class.forName(map.get(JOB_CLASS))
-				.asSubclass(JobDetail.class);
-		JobDetail jobDetail = clz.newInstance();
-		jobDetail.setJobClass(Class.forName(map.get(JOB_JOBCLASS)));
+		final JobDetail jobDetail;
+		final Class<? extends JobDetail> clz;
+
+		final String jobClassName = map.get(JOB_CLASS);
+		try {
+			clz = Class.forName(jobClassName)
+					.asSubclass(JobDetail.class);
+		} catch (ClassNotFoundException ex) {
+			throw new IllegalStateException("couldn't load job class " +
+					"('" + jobClassName + "') as " + JobDetail.class.getName());
+		}
+		try {
+			jobDetail = clz.newInstance();
+			jobDetail.setJobClass(Class.forName(map.get(JOB_JOBCLASS)));
+		} catch (ClassNotFoundException e) {
+			throw new IllegalStateException("couldn't load job's job class", e);
+		} catch (InstantiationException e) {
+			throw new IllegalStateException("couldn't instantiate job class", e);
+		} catch (IllegalAccessException e) {
+			throw new IllegalStateException("couldn't instantiate job class", e);
+		}
+
 		jobDetail.setName(map.get(JOB_NAME));
 		jobDetail.setGroup(map.get(JOB_GROUP));
 		jobDetail.setJobDataMap(mapper.readValue(map.get(JOB_DATA_MAP),
@@ -606,35 +627,33 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Retrieve the given <code>{@link org.quartz.Trigger}</code>.
 	 * </p>
-	 * 
-	 * @param triggerName
-	 *            The name of the <code>Trigger</code> to be retrieved.
-	 * @param groupName
-	 *            The group name of the <code>Trigger</code> to be retrieved.
+	 *
+	 * @param triggerName The name of the <code>Trigger</code> to be retrieved.
+	 * @param groupName   The group name of the <code>Trigger</code> to be retrieved.
 	 * @return The desired <code>Trigger</code>, or null if there is no match.
 	 */
 	@Override
 	public Trigger retrieveTrigger(SchedulingContext ctxt, String triggerName,
-			String groupName) {
+	                               String groupName) {
 		logDebug("Retrieving Trigger: ", triggerName, ".", groupName);
 		String key = TriggerWrapper.getTriggerNameKey(triggerName, groupName);
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain, key)
-						.withConsistentRead(new Boolean(true)));
+						.withConsistentRead(Boolean.TRUE));
 		TriggerWrapper tw = null;
 		try {
 			tw = triggerFromAttributes(result.getAttributes());
 			return tw.trigger;
-		} catch (Exception e) {
-			logDebug("Trigger not found: ", triggerName, ".", groupName);
+		} catch (IOException e) {
+			logDebug("Trigger not found: ", triggerName, ".", groupName, e);
+			return null;
 		}
-		return null;
 	}
 
 	private TriggerWrapper triggerFromAttributes(List<Attribute> attributes)
-			throws Exception {
+			throws IOException {
 		if (attributes == null || attributes.size() == 0) {
-			throw new Exception("No attributes");
+			throw new IllegalArgumentException("No attributes");
 		}
 
 		Map<String, String> map = new HashMap<String, String>();
@@ -642,12 +661,17 @@ public class SimpleDbJobStore implements JobStore {
 			map.put(attr.getName(), attr.getValue());
 		}
 
-		Class<? extends Trigger> clz = Class.forName(map.get(TRIGGER_CLASS))
-				.asSubclass(Trigger.class);
+		Class<? extends Trigger> clz;
+		try {
+			clz = Class.forName(map.get(TRIGGER_CLASS))
+					.asSubclass(Trigger.class);
+		} catch (ClassNotFoundException e) {
+			throw new IllegalStateException("couldn't load trigger class", e);
+		}
 
 		int len = Integer.parseInt(map.get(TRIGGER_JSON_LENGTH));
 		int n = (len - 1) / MAX_ATTR_LENGTH + 1;
-		StringBuffer buf = new StringBuffer();
+		StringBuilder buf = new StringBuilder();
 		for (int i = 0; i < n; i++) {
 			buf.append(map.get(TRIGGER_JSON + String.valueOf(i)));
 		}
@@ -660,11 +684,15 @@ public class SimpleDbJobStore implements JobStore {
 		}
 		trigger.setJobName(map.get(TRIGGER_JOB_NAME));
 		trigger.setJobGroup(map.get(TRIGGER_JOB_GROUP));
-		trigger.setStartTime(dateFormat.parse(map.get(TRIGGER_START_TIME)));
-		if (map.get(TRIGGER_END_TIME) != null) {
-			trigger.setEndTime(dateFormat.parse(map.get(TRIGGER_END_TIME)));
+		try {
+			trigger.setStartTime(dateFormat.parse(map.get(TRIGGER_START_TIME)));
+			if (map.get(TRIGGER_END_TIME) != null) {
+				trigger.setEndTime(dateFormat.parse(map.get(TRIGGER_END_TIME)));
+			}
+			trigger.setPriority(Integer.parseInt(map.get(TRIGGER_PRIORITY)));
+		} catch (ParseException e) {
+			throw new IOException(e);
 		}
-		trigger.setPriority(Integer.parseInt(map.get(TRIGGER_PRIORITY)));
 
 		TriggerWrapper wrapper = new TriggerWrapper(trigger);
 		if (map.get(TRIGGER_STATE) != null) {
@@ -686,7 +714,7 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Get the current state of the identified <code>{@link Trigger}</code>.
 	 * </p>
-	 * 
+	 *
 	 * @see Trigger#STATE_NORMAL
 	 * @see Trigger#STATE_PAUSED
 	 * @see Trigger#STATE_COMPLETE
@@ -696,19 +724,21 @@ public class SimpleDbJobStore implements JobStore {
 	 */
 	@Override
 	public int getTriggerState(SchedulingContext ctxt, String triggerName,
-			String groupName) throws JobPersistenceException {
+	                           String groupName) throws JobPersistenceException {
 		logDebug("Finding state of Trigger: ", triggerName, ".", groupName);
 		String key = TriggerWrapper.getTriggerNameKey(triggerName, groupName);
 
-		TriggerWrapper tw = null;
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain, key)
-						.withConsistentRead(new Boolean(true)));
+						.withConsistentRead(Boolean.TRUE));
+
+		TriggerWrapper tw;
 		try {
 			tw = triggerFromAttributes(result.getAttributes());
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error("Error finding state of Trigger: " + triggerName + "."
 					+ groupName, e);
+			return Trigger.STATE_NONE;
 		}
 
 		if (tw == null) {
@@ -736,25 +766,21 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Store the given <code>{@link org.quartz.Calendar}</code>.
 	 * </p>
-	 * 
-	 * @param calendar
-	 *            The <code>Calendar</code> to be stored.
-	 * @param replaceExisting
-	 *            If <code>true</code>, any <code>Calendar</code> existing in
-	 *            the <code>JobStore</code> with the same name & group should be
-	 *            over-written.
-	 * @param updateTriggers
-	 *            If <code>true</code>, any <code>Trigger</code>s existing in
-	 *            the <code>JobStore</code> that reference an existing Calendar
-	 *            with the same name with have their next fire time re-computed
-	 *            with the new <code>Calendar</code>.
-	 * @throws ObjectAlreadyExistsException
-	 *             if a <code>Calendar</code> with the same name already exists,
-	 *             and replaceExisting is set to false.
+	 *
+	 * @param calendar        The <code>Calendar</code> to be stored.
+	 * @param replaceExisting If <code>true</code>, any <code>Calendar</code> existing in
+	 *                        the <code>JobStore</code> with the same name & group should be
+	 *                        over-written.
+	 * @param updateTriggers  If <code>true</code>, any <code>Trigger</code>s existing in
+	 *                        the <code>JobStore</code> that reference an existing Calendar
+	 *                        with the same name with have their next fire time re-computed
+	 *                        with the new <code>Calendar</code>.
+	 * @throws ObjectAlreadyExistsException if a <code>Calendar</code> with the same name already exists,
+	 *                                      and replaceExisting is set to false.
 	 */
 	@Override
 	public void storeCalendar(SchedulingContext ctxt, String name,
-			Calendar calendar, boolean replaceExisting, boolean updateTriggers)
+	                          Calendar calendar, boolean replaceExisting, boolean updateTriggers)
 			throws ObjectAlreadyExistsException {
 
 	}
@@ -764,16 +790,15 @@ public class SimpleDbJobStore implements JobStore {
 	 * Remove (delete) the <code>{@link org.quartz.Calendar}</code> with the
 	 * given name.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If removal of the <code>Calendar</code> would result in
 	 * <code>Trigger</code>s pointing to non-existent calendars, then a
 	 * <code>JobPersistenceException</code> will be thrown.
 	 * </p>
 	 * *
-	 * 
-	 * @param calName
-	 *            The name of the <code>Calendar</code> to be removed.
+	 *
+	 * @param calName The name of the <code>Calendar</code> to be removed.
 	 * @return <code>true</code> if a <code>Calendar</code> with the given name
 	 *         was found and removed from the store.
 	 */
@@ -788,9 +813,8 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Retrieve the given <code>{@link org.quartz.Trigger}</code>.
 	 * </p>
-	 * 
-	 * @param calName
-	 *            The name of the <code>Calendar</code> to be retrieved.
+	 *
+	 * @param calName The name of the <code>Calendar</code> to be retrieved.
 	 * @return The desired <code>Calendar</code>, or null if there is no match.
 	 */
 	@Override
@@ -807,15 +831,10 @@ public class SimpleDbJobStore implements JobStore {
 	@Override
 	public int getNumberOfJobs(SchedulingContext ctxt) {
 		logDebug("Finding number of jobs");
-		try {
-			SelectResult result = amazonSimpleDb.select(new SelectRequest(query
-					.countJobs()));
-			Item item = result.getItems().get(0);
-			return Integer.parseInt(item.getAttributes().get(0).getValue());
-		} catch (Exception e) {
-			log.error("Could not find number of jobs", e);
-			return -1;
-		}
+		SelectResult result = amazonSimpleDb.select(new SelectRequest(query
+				.countJobs()));
+		Item item = result.getItems().get(0);
+		return Integer.parseInt(item.getAttributes().get(0).getValue());
 	}
 
 	/**
@@ -827,15 +846,10 @@ public class SimpleDbJobStore implements JobStore {
 	@Override
 	public int getNumberOfTriggers(SchedulingContext ctxt) {
 		logDebug("Finding number of triggers");
-		try {
-			SelectResult result = amazonSimpleDb.select(new SelectRequest(query
-					.countTriggers()));
-			Item item = result.getItems().get(0);
-			return Integer.parseInt(item.getAttributes().get(0).getValue());
-		} catch (Exception e) {
-			log.error("Could not find number of triggers", e);
-			return -1;
-		}
+		SelectResult result = amazonSimpleDb.select(new SelectRequest(query
+				.countTriggers()));
+		Item item = result.getItems().get(0);
+		return Integer.parseInt(item.getAttributes().get(0).getValue());
 	}
 
 	/**
@@ -874,7 +888,7 @@ public class SimpleDbJobStore implements JobStore {
 	 * Get the names of all of the <code>{@link org.quartz.Calendar}</code> s in
 	 * the <code>JobStore</code>.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If there are no Calendars in the given group name, the result should be a
 	 * zero-length array (not <code>null</code>).
@@ -950,14 +964,14 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Get all of the Triggers that are associated to the given Job.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If there are no matches, a zero-length array should be returned.
 	 * </p>
 	 */
 	@Override
 	public Trigger[] getTriggersForJob(SchedulingContext ctxt, String jobName,
-			String groupName) {
+	                                   String groupName) {
 		logDebug("Get triggers for Job: " + jobName + "." + groupName);
 		SelectResult result = amazonSimpleDb.select(new SelectRequest(query
 				.triggersForJob(jobName, groupName)));
@@ -966,11 +980,13 @@ public class SimpleDbJobStore implements JobStore {
 		int i = 0;
 		for (Item item : items) {
 			try {
+				logDebug("loading trigger for ", item.getName());
 				TriggerWrapper tw = triggerFromAttributes(item.getAttributes());
 				triggers[i++] = tw.trigger;
-			} catch (Exception e) {
-				log.error("Could not create trigger for Item: "
-						+ item.getName());
+			} catch (IOException e) {
+				final String msg = "Could not create trigger for Item: " + item.getName();
+				log.error(msg, e);
+				throw new IllegalStateException(msg, e);
 			}
 		}
 		return triggers;
@@ -980,22 +996,21 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Pause the <code>{@link Trigger}</code> with the given name.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void pauseTrigger(SchedulingContext ctxt, String triggerName,
-			String groupName) {
+	                         String groupName) {
 		logDebug("Pausing Trigger: ", triggerName, ".", groupName);
 		String key = TriggerWrapper.getTriggerNameKey(triggerName, groupName);
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain, key)
-						.withConsistentRead(new Boolean(true)));
+						.withConsistentRead(Boolean.TRUE));
 		TriggerWrapper tw = null;
 
 		try {
 			tw = triggerFromAttributes(result.getAttributes());
-		} catch (Exception e) {
-			log.error("Could not create trigger for Item: " + result.toString());
+		} catch (IOException e) {
+			log.error("Could not create trigger for Item: " + result.toString(), e);
 		}
 
 		// does the trigger exist?
@@ -1022,21 +1037,20 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Pause all of the <code>{@link Trigger}s</code> in the given group.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * The JobStore should "remember" that the group is paused, and impose the
 	 * pause on any new triggers that are added to the group while the group is
 	 * paused.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void pauseTriggerGroup(SchedulingContext ctxt, String groupName) {
 		logDebug("Pausing all triggers of goup: ", groupName);
 		String[] names = getTriggerNames(ctxt, groupName);
 
-		for (int i = 0; i < names.length; i++) {
-			pauseTrigger(ctxt, names[i], groupName);
+		for (String name : names) {
+			pauseTrigger(ctxt, name, groupName);
 		}
 	}
 
@@ -1045,15 +1059,14 @@ public class SimpleDbJobStore implements JobStore {
 	 * Pause the <code>{@link org.quartz.JobDetail}</code> with the given name -
 	 * by pausing all of its current <code>Trigger</code>s.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void pauseJob(SchedulingContext ctxt, String jobName,
-			String groupName) {
+	                     String groupName) {
 		logDebug("Pausing all triggers of Job: ", jobName, ".", groupName);
 		Trigger[] triggers = getTriggersForJob(ctxt, jobName, groupName);
-		for (int j = 0; j < triggers.length; j++) {
-			pauseTrigger(ctxt, triggers[j].getName(), triggers[j].getGroup());
+		for (Trigger trigger : triggers) {
+			pauseTrigger(ctxt, trigger.getName(), trigger.getGroup());
 		}
 	}
 
@@ -1062,8 +1075,8 @@ public class SimpleDbJobStore implements JobStore {
 	 * Pause all of the <code>{@link org.quartz.JobDetail}s</code> in the given
 	 * group - by pausing all of their <code>Trigger</code>s.
 	 * </p>
-	 * 
-	 * 
+	 * <p/>
+	 * <p/>
 	 * <p>
 	 * The JobStore should "remember" that the group is paused, and impose the
 	 * pause on any new jobs that are added to the group while the group is
@@ -1074,11 +1087,11 @@ public class SimpleDbJobStore implements JobStore {
 	public void pauseJobGroup(SchedulingContext ctxt, String groupName) {
 		logDebug("Pausing all jobs of group: ", groupName);
 		String[] jobNames = getJobNames(ctxt, groupName);
-		for (int i = 0; i < jobNames.length; i++) {
-			Trigger[] triggers = getTriggersForJob(ctxt, jobNames[i], groupName);
-			for (int j = 0; j < triggers.length; j++) {
-				pauseTrigger(ctxt, triggers[j].getName(),
-						triggers[j].getGroup());
+		for (String jobName : jobNames) {
+			Trigger[] triggers = getTriggersForJob(ctxt, jobName, groupName);
+			for (Trigger trigger : triggers) {
+				pauseTrigger(ctxt, trigger.getName(),
+						trigger.getGroup());
 			}
 		}
 	}
@@ -1087,27 +1100,26 @@ public class SimpleDbJobStore implements JobStore {
 	 * <p>
 	 * Resume (un-pause) the <code>{@link Trigger}</code> with the given name.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If the <code>Trigger</code> missed one or more fire-times, then the
 	 * <code>Trigger</code>'s misfire instruction will be applied.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void resumeTrigger(SchedulingContext ctxt, String triggerName,
-			String groupName) {
+	                          String groupName) {
 		logDebug("Resuming Trigger: ", triggerName, ".", groupName);
 		String key = TriggerWrapper.getTriggerNameKey(triggerName, groupName);
 
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain, key)
-						.withConsistentRead(new Boolean(true)));
+						.withConsistentRead(Boolean.TRUE));
 		TriggerWrapper tw = null;
 
 		try {
 			tw = triggerFromAttributes(result.getAttributes());
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error("Could not create trigger for Item: " + result.toString());
 		}
 
@@ -1130,19 +1142,18 @@ public class SimpleDbJobStore implements JobStore {
 	 * Resume (un-pause) all of the <code>{@link Trigger}s</code> in the given
 	 * group.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If any <code>Trigger</code> missed one or more fire-times, then the
 	 * <code>Trigger</code>'s misfire instruction will be applied.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void resumeTriggerGroup(SchedulingContext ctxt, String groupName) {
 		logDebug("Resuming all triggers of group: ", groupName);
 		String[] names = getTriggerNames(ctxt, groupName);
-		for (int i = 0; i < names.length; i++) {
-			resumeTrigger(ctxt, names[i], groupName);
+		for (String name : names) {
+			resumeTrigger(ctxt, name, groupName);
 		}
 	}
 
@@ -1151,21 +1162,20 @@ public class SimpleDbJobStore implements JobStore {
 	 * Resume (un-pause) the <code>{@link org.quartz.JobDetail}</code> with the
 	 * given name.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If any of the <code>Job</code>'s<code>Trigger</code> s missed one or more
 	 * fire-times, then the <code>Trigger</code>'s misfire instruction will be
 	 * applied.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void resumeJob(SchedulingContext ctxt, String jobName,
-			String groupName) {
+	                      String groupName) {
 		logDebug("Resuming all triggers for Job: ", jobName, ".", groupName);
 		Trigger[] triggers = getTriggersForJob(ctxt, jobName, groupName);
-		for (int j = 0; j < triggers.length; j++) {
-			resumeTrigger(ctxt, triggers[j].getName(), triggers[j].getGroup());
+		for (Trigger trigger : triggers) {
+			resumeTrigger(ctxt, trigger.getName(), trigger.getGroup());
 		}
 	}
 
@@ -1174,24 +1184,23 @@ public class SimpleDbJobStore implements JobStore {
 	 * Resume (un-pause) all of the <code>{@link org.quartz.JobDetail}s</code>
 	 * in the given group.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If any of the <code>Job</code> s had <code>Trigger</code> s that missed
 	 * one or more fire-times, then the <code>Trigger</code>'s misfire
 	 * instruction will be applied.
 	 * </p>
-	 * 
 	 */
 	@Override
 	public void resumeJobGroup(SchedulingContext ctxt, String groupName) {
 		logDebug("Resuming all jobs of group: ", groupName);
 		String[] jobNames = getJobNames(ctxt, groupName);
 
-		for (int i = 0; i < jobNames.length; i++) {
-			Trigger[] triggers = getTriggersForJob(ctxt, jobNames[i], groupName);
-			for (int j = 0; j < triggers.length; j++) {
-				resumeTrigger(ctxt, triggers[j].getName(),
-						triggers[j].getGroup());
+		for (String jobName : jobNames) {
+			Trigger[] triggers = getTriggersForJob(ctxt, jobName, groupName);
+			for (Trigger trigger : triggers) {
+				resumeTrigger(ctxt, trigger.getName(),
+						trigger.getGroup());
 			}
 		}
 	}
@@ -1201,12 +1210,12 @@ public class SimpleDbJobStore implements JobStore {
 	 * Pause all triggers - equivalent of calling
 	 * <code>pauseTriggerGroup(group)</code> on every group.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * When <code>resumeAll()</code> is called (to un-pause), trigger misfire
 	 * instructions WILL be applied.
 	 * </p>
-	 * 
+	 *
 	 * @see #resumeAll(SchedulingContext)
 	 * @see #pauseTriggerGroup(SchedulingContext, String)
 	 */
@@ -1214,8 +1223,8 @@ public class SimpleDbJobStore implements JobStore {
 	public void pauseAll(SchedulingContext ctxt) {
 		logDebug("Pausing all triggers");
 		String[] names = getTriggerGroupNames(ctxt);
-		for (int i = 0; i < names.length; i++) {
-			pauseTriggerGroup(ctxt, names[i]);
+		for (String name : names) {
+			pauseTriggerGroup(ctxt, name);
 		}
 	}
 
@@ -1224,20 +1233,20 @@ public class SimpleDbJobStore implements JobStore {
 	 * Resume (un-pause) all triggers - equivalent of calling
 	 * <code>resumeTriggerGroup(group)</code> on every group.
 	 * </p>
-	 * 
+	 * <p/>
 	 * <p>
 	 * If any <code>Trigger</code> missed one or more fire-times, then the
 	 * <code>Trigger</code>'s misfire instruction will be applied.
 	 * </p>
-	 * 
+	 *
 	 * @see #pauseAll(SchedulingContext)
 	 */
 	@Override
 	public void resumeAll(SchedulingContext ctxt) {
 		logDebug("Resuming all triggers");
 		String[] names = getTriggerGroupNames(ctxt);
-		for (int i = 0; i < names.length; i++) {
-			resumeTriggerGroup(ctxt, names[i]);
+		for (String name : names) {
+			resumeTriggerGroup(ctxt, name);
 		}
 	}
 
@@ -1286,7 +1295,7 @@ public class SimpleDbJobStore implements JobStore {
 	 * Get a handle to the next trigger to be fired, and mark it as 'reserved'
 	 * by the calling scheduler.
 	 * </p>
-	 * 
+	 *
 	 * @see #releaseAcquiredTrigger(SchedulingContext, Trigger)
 	 */
 	@Override
@@ -1294,7 +1303,7 @@ public class SimpleDbJobStore implements JobStore {
 		log.info("Acquiring next trigger: "
 				+ query.acquireTrigger(dateFormat.format(new Date(noLaterThan))));
 		SelectResult result = amazonSimpleDb.select(new SelectRequest(query
-				.acquireTrigger(dateFormat.format(new Date(noLaterThan)))));
+				.acquireTrigger(dateFormat.format(new Date(noLaterThan))), isConsistentPoll()));
 		List<Item> items = result.getItems();
 
 		if (items.size() == 1) {
@@ -1310,7 +1319,7 @@ public class SimpleDbJobStore implements JobStore {
 					removeTrigger(ctxt, tw.trigger.getName(),
 							tw.trigger.getGroup());
 				}
-			} catch (Exception e) {
+			} catch (IOException e) {
 				log.error("Could not acquire trigger", e);
 			}
 		}
@@ -1330,15 +1339,14 @@ public class SimpleDbJobStore implements JobStore {
 		String key = TriggerWrapper.getTriggerNameKey(trigger);
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain, key)
-						.withConsistentRead(new Boolean(true)));
-		TriggerWrapper tw = null;
+						.withConsistentRead(Boolean.TRUE));
 		try {
-			tw = triggerFromAttributes(result.getAttributes());
+			TriggerWrapper tw = triggerFromAttributes(result.getAttributes());
 			if (tw.state == TriggerWrapper.STATE_ACQUIRED) {
 				tw.state = TriggerWrapper.STATE_WAITING;
 				updateState(tw);
 			}
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error("Could not release Trigger: " + trigger.getFullName(), e);
 		}
 	}
@@ -1352,18 +1360,18 @@ public class SimpleDbJobStore implements JobStore {
 	 */
 	@Override
 	public TriggerFiredBundle triggerFired(SchedulingContext ctxt,
-			Trigger trigger) {
+	                                       Trigger trigger) {
 
 		logDebug("Fired Trigger: ", trigger.getFullName());
 		String key = TriggerWrapper.getTriggerNameKey(trigger);
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain, key)
-						.withConsistentRead(new Boolean(true)));
+						.withConsistentRead(Boolean.TRUE));
 		TriggerWrapper tw = null;
 		try {
 			tw = triggerFromAttributes(result.getAttributes());
-		} catch (Exception e) {
-			log.error("Could not load Trigger: " + trigger.getFullName());
+		} catch (IOException e) {
+			log.error("Could not load Trigger: " + trigger.getFullName(), e);
 		}
 
 		// was the trigger deleted since being acquired?
@@ -1392,8 +1400,8 @@ public class SimpleDbJobStore implements JobStore {
 			storeTrigger(ctxt, trigger, true);
 			tw.state = TriggerWrapper.STATE_WAITING;
 			updateState(tw);
-		} catch (Exception e) {
-			log.error("Error while firing Trigger: " + trigger.getFullName());
+		} catch (JobPersistenceException e) {
+			log.error("Error while firing Trigger: " + trigger.getFullName(), e);
 		}
 
 		TriggerFiredBundle bndle = new TriggerFiredBundle(retrieveJob(ctxt,
@@ -1419,21 +1427,21 @@ public class SimpleDbJobStore implements JobStore {
 	 */
 	@Override
 	public void triggeredJobComplete(SchedulingContext ctxt, Trigger trigger,
-			JobDetail jobDetail, int triggerInstCode) {
+	                                 JobDetail jobDetail, int triggerInstCode) {
 		logDebug("Completing Job: ", trigger.getFullName());
 
 		String jobKey = JobWrapper.getJobNameKey(jobDetail.getName(),
 				jobDetail.getGroup());
 		GetAttributesResult jobresult = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(jobDomain, jobKey)
-						.withConsistentRead(new Boolean(true)));
+						.withConsistentRead(Boolean.TRUE));
 		JobDetail job = null;
 		try {
 			job = jobDetailFromAttributes(jobresult.getAttributes());
 			if (job.isStateful()) {
-				// TODO: Implement support for stateful jobs
+				throw new IllegalStateException("TODO: can't handle stateful jobs right now"); // TODO
 			}
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error(
 					"Could not complete job for Trigger: "
 							+ trigger.getFullName(), e);
@@ -1442,12 +1450,12 @@ public class SimpleDbJobStore implements JobStore {
 		String triggerKey = TriggerWrapper.getTriggerNameKey(trigger);
 		GetAttributesResult result = amazonSimpleDb
 				.getAttributes(new GetAttributesRequest(triggerDomain,
-						triggerKey).withConsistentRead(new Boolean(true)));
+						triggerKey).withConsistentRead(Boolean.TRUE));
 		TriggerWrapper tw = null;
 
 		try {
 			tw = triggerFromAttributes(result.getAttributes());
-		} catch (Exception e) {
+		} catch (IOException e) {
 			log.error("Could not find Trigger: " + trigger.getFullName(), e);
 		}
 
@@ -1498,12 +1506,12 @@ public class SimpleDbJobStore implements JobStore {
 	}
 
 	protected void setAllTriggersOfJobToState(String jobName, String jobGroup,
-			int state) {
+	                                          int state) {
 		logDebug("Setting state of all triggers of Job: ", jobName, ".",
 				jobGroup);
 		Trigger[] triggers = getTriggersForJob(null, jobName, jobGroup);
-		for (int i = 0; i < triggers.length; i++) {
-			TriggerWrapper tw = new TriggerWrapper(triggers[i]);
+		for (Trigger trigger : triggers) {
+			TriggerWrapper tw = new TriggerWrapper(trigger);
 			if (state != TriggerWrapper.STATE_WAITING) {
 				removeTrigger(null, tw.trigger.getName(), tw.trigger.getGroup());
 			} else {
@@ -1542,7 +1550,7 @@ public class SimpleDbJobStore implements JobStore {
 		return false;
 	}
 
-	private void logDebug(Object... args) {
+	private static void logDebug(Object... args) {
 		if (log.isDebugEnabled()) {
 			StringBuilder buffer = new StringBuilder(256);
 			for (Object object : args) {
@@ -1554,9 +1562,10 @@ public class SimpleDbJobStore implements JobStore {
 
 }
 
-/*******************************************************************************
+/**
+ * ****************************************************************************
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * 
+ * <p/>
  * Helper Classes. * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
  * * * *
  */
